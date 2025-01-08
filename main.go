@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/proxy"
 
@@ -27,6 +28,8 @@ var (
 	localAddr   string
 	localPort   int
 	httpPort    int
+	sshClient    *ssh.Client
+	sshConnMutex sync.Mutex
 )
 
 func init() {
@@ -101,6 +104,41 @@ func getPassword() (string, error) {
 	return string(password), nil
 }
 
+// 新增函数：检查SSH连接并在需要时重连
+func maintainSSHConnection(config *ssh.ClientConfig) {
+	for {
+		time.Sleep(30 * time.Second)
+		
+		sshConnMutex.Lock()
+		if sshClient == nil {
+			log.Printf("SSH 连接不存在，尝试重新连接...")
+		} else {
+			// 发送一个 keep-alive 消息来检查连接
+			_, _, err := sshClient.SendRequest("keepalive@golang.org", true, nil)
+			if err != nil {
+				log.Printf("SSH 连接已断开，正在重新连接: %v", err)
+				sshClient.Close()
+				sshClient = nil
+			} else {
+				sshConnMutex.Unlock()
+				continue
+			}
+		}
+
+		// 尝试重新连接
+		newClient, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), config)
+		if err != nil {
+			log.Printf("重新连接失败: %v", err)
+			sshConnMutex.Unlock()
+			continue
+		}
+		
+		sshClient = newClient
+		log.Printf("SSH 连接已重新建立")
+		sshConnMutex.Unlock()
+	}
+}
+
 func main() {
 	flag.Parse()
 
@@ -156,21 +194,43 @@ func main() {
 		}
 	}
 
-	// 连接SSH服务器
-	sshClient, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), config)
+	// 初始连接
+	var err error
+	sshClient, err = ssh.Dial("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), config)
 	if err != nil {
 		log.Fatalf("无法连接到SSH服务器: %v", err)
 	}
-	defer sshClient.Close()
 
+	// 启动连接维护协程
+	go maintainSSHConnection(config)
+
+	// 添加就绪标志
+	socksReady := make(chan struct{})
+	httpReady := make(chan struct{})
+	
 	// 启动SOCKS5服务器
-	go startSocks5Server(localAddr, localPort, sshClient)
-
+	go func() {
+		startSocks5Server(localAddr, localPort, sshClient)
+		close(socksReady)
+	}()
+	
 	// 启动HTTP代理服务器
-	log.Printf("HTTP代理服务器正在监听 %s:%d", localAddr, httpPort)
-	if err := startHttpProxy(localAddr, httpPort, fmt.Sprintf("%s:%d", localAddr, localPort)); err != nil {
-		log.Fatalf("启动HTTP代理服务器失败: %v", err)
-	}
+	go func() {
+		log.Printf("HTTP代理服务器正在监听 %s:%d", localAddr, httpPort)
+		if err := startHttpProxy(localAddr, httpPort, fmt.Sprintf("%s:%d", localAddr, localPort)); err != nil {
+			log.Printf("启动HTTP代理服务器失败: %v", err)
+		}
+		close(httpReady)
+	}()
+	
+	// 等待两个服务都就绪
+	<-socksReady
+	<-httpReady
+	
+	log.Printf("所有服务已就绪")
+	
+	// 保持程序运行
+	select {}
 }
 
 func startSocks5Server(addr string, port int, sshClient *ssh.Client) {
@@ -313,19 +373,45 @@ func (h *httpProxyHandler) handleHttps(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 }
 
-func handleConnection(client net.Conn, sshClient *ssh.Client) {
+func handleConnection(client net.Conn, sshConn *ssh.Client) {
 	defer client.Close()
 
+	// 添加重试次数
+	maxRetries := 3
+	for retry := 0; retry < maxRetries; retry++ {
+		sshConnMutex.Lock()
+		currentSSH := sshClient
+		sshConnMutex.Unlock()
+		
+		if currentSSH == nil {
+			log.Printf("等待 SSH 连接重新建立...")
+			time.Sleep(time.Second * time.Duration(retry+1))
+			continue
+		}
+
+		if err := handleSocks5Connection(client, currentSSH); err != nil {
+			if retry < maxRetries-1 {
+				log.Printf("连接处理失败，尝试重试 %d/%d: %v", retry+1, maxRetries, err)
+				time.Sleep(time.Second * time.Duration(retry+1))
+				continue
+			}
+			log.Printf("连接处理最终失败: %v", err)
+		}
+		break
+	}
+}
+
+func handleSocks5Connection(client net.Conn, sshConn *ssh.Client) error {
 	// 读取SOCKS5握手
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(client, buf[:2]); err != nil {
 		log.Printf("读取SOCKS5握手错误: %v", err)
-		return
+		return err
 	}
 
 	if buf[0] != 0x05 { // SOCKS5版本
 		log.Printf("不支持的SOCKS版本: %d", buf[0])
-		return
+		return fmt.Errorf("不支持的SOCKS版本: %d", buf[0])
 	}
 
 	// 读取认证方法数量
@@ -333,7 +419,7 @@ func handleConnection(client net.Conn, sshClient *ssh.Client) {
 	methods := make([]byte, methodCount)
 	if _, err := io.ReadFull(client, methods); err != nil {
 		log.Printf("读取认证方法错误: %v", err)
-		return
+		return err
 	}
 
 	// 回复不需要认证
@@ -342,7 +428,7 @@ func handleConnection(client net.Conn, sshClient *ssh.Client) {
 	// 读取请求头
 	if _, err := io.ReadFull(client, buf[:4]); err != nil {
 		log.Printf("读取请求错误: %v", err)
-		return
+		return err
 	}
 
 	var addr string
@@ -351,47 +437,47 @@ func handleConnection(client net.Conn, sshClient *ssh.Client) {
 		ipv4 := make([]byte, 4)
 		if _, err := io.ReadFull(client, ipv4); err != nil {
 			log.Printf("读取IPv4地址错误: %v", err)
-			return
+			return err
 		}
 		addr = net.IP(ipv4).String()
 	case 0x03: // 域名
 		domainLen := make([]byte, 1)
 		if _, err := io.ReadFull(client, domainLen); err != nil {
 			log.Printf("读取域名长度错误: %v", err)
-			return
+			return err
 		}
 		domain := make([]byte, domainLen[0])
 		if _, err := io.ReadFull(client, domain); err != nil {
 			log.Printf("读取域名错误: %v", err)
-			return
+			return err
 		}
 		addr = string(domain)
 	case 0x04: // IPv6
 		ipv6 := make([]byte, 16)
 		if _, err := io.ReadFull(client, ipv6); err != nil {
 			log.Printf("读取IPv6地址错误: %v", err)
-			return
+			return err
 		}
 		addr = net.IP(ipv6).String()
 	default:
 		log.Printf("不支持的地址类型: %d", buf[3])
-		return
+		return fmt.Errorf("不支持的地址类型: %d", buf[3])
 	}
 
 	// 读取端口
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(client, portBuf); err != nil {
 		log.Printf("读取端口错误: %v", err)
-		return
+		return err
 	}
 	port := int(portBuf[0])<<8 | int(portBuf[1])
 
 	// 通过SSH隧道建立到目标地址的连接
-	target, err := sshClient.Dial("tcp", fmt.Sprintf("%s:%d", addr, port))
+	target, err := sshConn.Dial("tcp", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
 		log.Printf("连接目标地址错误: %v", err)
 		client.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
+		return err
 	}
 	defer target.Close()
 
@@ -413,4 +499,6 @@ func handleConnection(client net.Conn, sshClient *ssh.Client) {
 	}()
 
 	wg.Wait()
+
+	return nil
 } 
